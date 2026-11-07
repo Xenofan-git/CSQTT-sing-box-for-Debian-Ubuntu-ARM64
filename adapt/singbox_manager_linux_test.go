@@ -26,10 +26,73 @@ func writeValidSingBoxConfigForTest(t *testing.T, path string) {
 	t.Helper()
 	encoded, err := buildSingBoxConfig(singBoxConfigInput{
 		ListenAddress: "127.0.0.1:19080",
-		CSQTTAddress: "127.0.0.1:19081",
+		CSQTTAddress: "127.0.0.1:19081", FinalOutbound: singBoxDirectTag,
 	})
 	if err != nil { t.Fatal(err) }
 	if err := os.WriteFile(path, encoded, 0600); err != nil { t.Fatal(err) }
+}
+
+func TestSingBoxManagerLoadConfigSortsExternalSOCKS5Outbounds(t *testing.T) {
+	dir := t.TempDir()
+	config := filepath.Join(dir, "config.json")
+	raw := `{"inbounds":[{"type":"socks","tag":"csqtt-route-in","listen":"127.0.0.1","listen_port":19080}],"outbounds":[{"type":"direct","tag":"direct"},{"type":"socks","tag":"socks-zeta","server":"zeta.example","server_port":1080},{"type":"socks","tag":"socks-alpha","server":"alpha.example","server_port":1081},{"type":"socks","tag":"csqtt","server":"127.0.0.1","server_port":19081}],"route":{"final":"direct","rules":[]}}`
+	if err := os.WriteFile(config, []byte(raw), 0600); err != nil { t.Fatal(err) }
+	manager := NewSingBoxManager("unused", config, filepath.Join(dir, "sing-box.log"))
+	for attempt := 0; attempt < 5; attempt++ {
+		loaded, err := manager.LoadConfig()
+		if err != nil { t.Fatalf("LoadConfig: %v", err) }
+		if len(loaded.SOCKS5) != 2 { t.Fatalf("loaded %d external outbounds, want 2: %#v", len(loaded.SOCKS5), loaded.SOCKS5) }
+		if loaded.SOCKS5[0].ID != "alpha" || loaded.SOCKS5[1].ID != "zeta" {
+			t.Fatalf("external SOCKS5 outbounds are not stable and sorted: %#v", loaded.SOCKS5)
+		}
+	}
+}
+
+func TestSingBoxManagerLoadConfigRejectsMalformedExternalSOCKS5(t *testing.T) {
+	cases := []struct {
+		name string
+		outbound string
+	}{
+		{name: "empty host", outbound: `{"type":"socks","tag":"socks-alpha","server":"","server_port":1080}`},
+		{name: "invalid host", outbound: `{"type":"socks","tag":"socks-alpha","server":"bad host","server_port":1080}`},
+		{name: "fractional port", outbound: `{"type":"socks","tag":"socks-alpha","server":"proxy.example","server_port":1080.5}`},
+		{name: "invalid id", outbound: `{"type":"socks","tag":"socks-bad/id","server":"proxy.example","server_port":1080}`},
+		{name: "incomplete credentials", outbound: `{"type":"socks","tag":"socks-alpha","server":"proxy.example","server_port":1080,"username":"user"}`},
+		{name: "wrong outbound type", outbound: `{"type":"direct","tag":"socks-alpha","server":"proxy.example","server_port":1080}`},
+		{name: "non-string credentials", outbound: `{"type":"socks","tag":"socks-alpha","server":"proxy.example","server_port":1080,"username":123,"password":"secret"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			config := filepath.Join(dir, "config.json")
+			raw := `{"inbounds":[{"type":"socks","tag":"csqtt-route-in","listen":"127.0.0.1","listen_port":19080}],"outbounds":[{"type":"direct","tag":"direct"},` + tc.outbound + `],"route":{"final":"direct","rules":[]}}`
+			if err := os.WriteFile(config, []byte(raw), 0600); err != nil { t.Fatal(err) }
+			manager := NewSingBoxManager("unused", config, filepath.Join(dir, "sing-box.log"))
+			if _, err := manager.LoadConfig(); err == nil {
+				t.Fatal("malformed persisted external SOCKS5 outbound was accepted")
+			}
+		})
+	}
+}
+
+func TestSingBoxManagerLoadConfigRejectsUnsafeCSQTTOutbound(t *testing.T) {
+	cases := []struct { name, server string; port int }{
+		{name: "non-loopback address", server: "192.168.1.20", port: 12500},
+		{name: "public address", server: "203.0.113.10", port: 12500},
+		{name: "same endpoint as inbound", server: "127.0.0.1", port: 19080},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			config := filepath.Join(dir, "config.json")
+			raw := fmt.Sprintf(`{"inbounds":[{"type":"socks","tag":"csqtt-route-in","listen":"127.0.0.1","listen_port":19080}],"outbounds":[{"type":"direct","tag":"direct"},{"type":"socks","tag":"csqtt","server":%q,"server_port":%d}],"route":{"final":"direct","rules":[]}}`, tc.server, tc.port)
+			if err := os.WriteFile(config, []byte(raw), 0600); err != nil { t.Fatal(err) }
+			manager := NewSingBoxManager("unused", config, filepath.Join(dir, "sing-box.log"))
+			if _, err := manager.LoadConfig(); err == nil {
+				t.Fatal("unsafe persisted CSQTT outbound was accepted")
+			}
+		})
+	}
 }
 
 func TestSingBoxListenIPAssignedMatchesExactInterfaceAddress(t *testing.T) {
@@ -128,7 +191,7 @@ func TestSingBoxManagerSaveConfigIsAtomicAndValidated(t *testing.T) {
 	binary := newFakeSingBox(t, "if [ \"$1\" = check ]; then grep -q 'invalid-marker' \"$3\" && { echo invalid >&2; exit 9; }; exit 0; fi\nexit 0")
 	manager := NewSingBoxManager(binary, config, filepath.Join(dir, "sing-box.log"))
 	input := singBoxConfigInput{
-		ListenAddress: "127.0.0.1:19080", CSQTTAddress: "127.0.0.1:19081",
+		ListenAddress: "127.0.0.1:19080", CSQTTAddress: "127.0.0.1:19081", FinalOutbound: singBoxDirectTag,
 		DirectDomainSuffixes: []string{".example.org"},
 		Rules: []singBoxRouteRule{{ID:"route-a", DomainKeywords:[]string{"stream"}, DomainRegexes:[]string{"video"}, IPCIDRs:[]string{"198.51.100.0/24"}, Outbound:singBoxCSQTTTag, Enabled:true}},
 	}
@@ -185,6 +248,7 @@ func TestSingBoxManagerStartRejectsTamperedPersistedRuleSetPathBeforeBinary(t *t
 	encoded, err := buildSingBoxConfig(singBoxConfigInput{
 		ListenAddress: "127.0.0.1:19080",
 		CSQTTAddress: "127.0.0.1:19081",
+		FinalOutbound: singBoxDirectTag,
 		RuleSets: []singBoxRuleSet{{Type: "local", Tag: "tampered", Format: "binary", Path: outside}},
 	})
 	if err != nil { t.Fatalf("build persisted tampered config fixture: %v", err) }
@@ -422,7 +486,7 @@ func TestSingBoxManagerUploadRuleSetRejectsNonCanonicalRegisteredPath(t *testing
 	nonCanonical := filepath.Join(setsDir, "other.json")
 	if err := os.WriteFile(nonCanonical, []byte(`{"version":3,"rules":[]}`), 0600); err != nil { t.Fatal(err) }
 	encoded, err := buildSingBoxConfig(singBoxConfigInput{
-		ListenAddress: "127.0.0.1:19080", CSQTTAddress: "127.0.0.1:19081",
+		ListenAddress: "127.0.0.1:19080", CSQTTAddress: "127.0.0.1:19081", FinalOutbound: singBoxDirectTag,
 		RuleSets: []singBoxRuleSet{{Type:"local", Tag:"stable", Format:"source", Path:nonCanonical}},
 	})
 	if err != nil { t.Fatal(err) }
@@ -456,7 +520,7 @@ func TestSingBoxManagerUploadRuleSetRejectsRegisteredRemoteAndFormatChange(t *te
 		t.Run(tc.name, func(t *testing.T) {
 			dir:=t.TempDir()
 			config:=filepath.Join(dir,"config.json")
-			encoded,err:=buildSingBoxConfig(singBoxConfigInput{ListenAddress:"127.0.0.1:19080",CSQTTAddress:"127.0.0.1:19081",RuleSets:[]singBoxRuleSet{tc.set}})
+			encoded,err:=buildSingBoxConfig(singBoxConfigInput{ListenAddress:"127.0.0.1:19080",CSQTTAddress:"127.0.0.1:19081",FinalOutbound:singBoxDirectTag,RuleSets:[]singBoxRuleSet{tc.set}})
 			if err!=nil { t.Fatal(err) }
 			if err:=os.WriteFile(config,encoded,0600);err!=nil { t.Fatal(err) }
 			manager:=NewSingBoxManager(ruleSetValidationFakeBinary(t,"normal"),config,filepath.Join(dir,"sing-box.log"))
@@ -475,7 +539,7 @@ func TestSingBoxManagerDeleteRuleSetRejectsAdvancedNestedRouteReference(t *testi
  if err := os.MkdirAll(ruleSetDir, 0700); err != nil { t.Fatal(err) }
  path := filepath.Join(ruleSetDir, "hidden-ref.srs")
  if err := os.WriteFile(path, []byte("managed ruleset"), 0600); err != nil { t.Fatal(err) }
- encoded, err := buildSingBoxConfig(singBoxConfigInput{ListenAddress:"127.0.0.1:19080", CSQTTAddress:"127.0.0.1:19081"})
+ encoded, err := buildSingBoxConfig(singBoxConfigInput{ListenAddress:"127.0.0.1:19080", CSQTTAddress:"127.0.0.1:19081",FinalOutbound:singBoxDirectTag})
  if err != nil { t.Fatal(err) }
  var raw map[string]any
  if err := json.Unmarshal(encoded, &raw); err != nil { t.Fatal(err) }
